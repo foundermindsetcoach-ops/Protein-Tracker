@@ -219,7 +219,6 @@
 // ---- config -------------------------------------------------------------
 const SEARCH_URL  = "https://search.openfoodfacts.org/search";
 const PRODUCT_URL = "https://world.openfoodfacts.org/api/v2/product/"; // + barcode + .json
-const UA = "PersonalProteinTracker/1.0";
 const STORE_KEY = "proteinTracker.v2";
 const CIRC = 2 * Math.PI * 56;
 
@@ -271,6 +270,28 @@ function readFood(product) {
   };
 }
 
+// ---- network helper -----------------------------------------------------
+// NOTE: browsers forbid scripts from setting a User-Agent header, and trying
+// to makes the whole request fail. So we never set it here. We add a timeout
+// and one automatic retry, since the search service is in beta and can be slow.
+async function fetchJSON(url, tries = 2) {
+  let lastErr;
+  for (let attempt = 0; attempt < tries; attempt++) {
+    if (attempt > 0) await new Promise(r => setTimeout(r, 1200)); // pause before retry
+    try {
+      const ctrl = new AbortController();
+      const timer = setTimeout(() => ctrl.abort(), 12000); // 12s timeout
+      const res = await fetch(url, { signal: ctrl.signal });
+      clearTimeout(timer);
+      if (!res.ok) throw new Error("server returned " + res.status);
+      return await res.json();
+    } catch (err) {
+      lastErr = err;
+    }
+  }
+  throw lastErr;
+}
+
 // ---- text search --------------------------------------------------------
 async function runSearch() {
   const q = $('q').value.trim();
@@ -281,36 +302,67 @@ async function runSearch() {
   try {
     const url = SEARCH_URL + "?q=" + encodeURIComponent(q) + "&page_size=12"
       + "&fields=code,product_name,brands,nutriments,serving_size,serving_quantity";
-    const res = await fetch(url, { headers: { 'User-Agent': UA } });
-    if (!res.ok) throw new Error("server " + res.status);
-    const data = await res.json();
+    const data = await fetchJSON(url);
     const hits = (data.hits || data.products || []).map(readFood).filter(Boolean);
-    if (!hits.length) { setStatus("No foods with protein data matched that. Try different words.", true); return; }
+    if (!hits.length) { setStatus("No foods with protein data matched that. Try fewer or different words — or add it by hand below.", true); showManualAdd(q); return; }
     setStatus(''); renderResults(hits);
   } catch (err) {
-    setStatus("Couldn't reach the food database (" + err.message + "). Check your connection and try again.", true);
+    setStatus("Search is having a moment (the food database's search is in beta and sometimes stalls). Scanning a barcode is the most reliable option — or add this food by hand below.", true);
+    showManualAdd(q);
   }
 }
 
-// ---- barcode lookup -----------------------------------------------------
+// ---- barcode lookup (the reliable path) ---------------------------------
 async function lookupBarcode(code) {
   setStatus('Looking up barcode ' + code + '…');
   $('results').innerHTML = ''; $('panelArea').innerHTML = '';
   try {
     const url = PRODUCT_URL + encodeURIComponent(code) + ".json"
       + "?fields=code,product_name,brands,nutriments,serving_size,serving_quantity";
-    const res = await fetch(url, { headers: { 'User-Agent': UA } });
-    if (!res.ok) throw new Error("server " + res.status);
-    const data = await res.json();
+    const data = await fetchJSON(url, 3); // barcode is reliable; try a bit harder
     if (data.status === 0 || !data.product) {
-      setStatus("That barcode isn't in the database yet. Try searching by name instead.", true); return;
+      setStatus("That barcode isn't in the database yet. Try searching by name, or add it by hand below.", true); showManualAdd(''); return;
     }
     const food = readFood(data.product);
-    if (!food) { setStatus("Found the product, but it has no protein data on record.", true); return; }
+    if (!food) { setStatus("Found the product, but it has no protein data on record. You can add it by hand below.", true); showManualAdd(data.product.product_name || ''); return; }
     setStatus(''); selectFood(food);
   } catch (err) {
-    setStatus("Couldn't look up that barcode (" + err.message + ").", true);
+    setStatus("Couldn't look up that barcode right now. Check your connection and try again, or add the food by hand below.", true);
+    showManualAdd('');
   }
+}
+
+// ---- manual add (always-available fallback) -----------------------------
+// Lets you type a food + its protein when search/scan can't find it.
+function showManualAdd(prefillName) {
+  $('panelArea').innerHTML = `
+    <div class="panel" style="background:#f7ece2; border-color:#e6cdb8;">
+      <div class="pname">Add a food by hand</div>
+      <div class="pmeta" style="color:#8a5a34;">Read the protein off the package, or ask anyone. Enter it once.</div>
+      <div class="controls">
+        <input type="text" id="mName" placeholder="Food name" value="${escapeHtml(prefillName || '')}" style="flex:1; min-width:160px;">
+      </div>
+      <div class="controls" style="margin-top:8px;">
+        <input type="number" id="mProtein" placeholder="Protein (g)" min="0" step="0.1" style="width:120px;">
+        <span style="font-family:'Helvetica Neue',Arial,sans-serif; font-size:13px; color:#8a5a34;">grams of protein, in</span>
+        <select id="mUnit">
+          <option value="serving">one serving</option>
+          <option value="100g">100 grams</option>
+        </select>
+        <button id="mAdd">Add to today</button>
+      </div>
+    </div>`;
+  $('mAdd').onclick = () => {
+    const name = $('mName').value.trim() || 'Food';
+    const protein = Number($('mProtein').value);
+    if (!protein || protein <= 0) return;
+    const unit = $('mUnit').value;
+    // Build a food object so the normal amount panel can take over.
+    const food = unit === '100g'
+      ? { name, brand: '', per100: protein, perServing: null, servingG: null, servingLabel: null }
+      : { name, brand: '', per100: null, perServing: protein, servingG: null, servingLabel: 'serving' };
+    selectFood(food);
+  };
 }
 
 function setStatus(msg, isErr) {
